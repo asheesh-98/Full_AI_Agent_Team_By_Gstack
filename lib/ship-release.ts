@@ -34,7 +34,7 @@ import { lanesOnlyHeadPolicy } from './pregate/head-policy';
 import { finishPlan } from './plan-record';
 import { PREPUSH_CHECK_IDS } from './pregate/index';
 import { buildRunCheck } from './pregate/run-check';
-import { bin, carryLane, carryNoneLines, evidenceExempt, firstLine, flagReader, fragmentPath, gh, git, hostedOrigin, laneLine, lanes, mappedLanes, recordCiTimeout, releasePaths, Report, runLanes, sh, shipPolicy, shipRunMarker, short, stampedFiles } from './ship-bin-common';
+import { bin, carryLane, carryNoneLines, evidenceExempt, firstLine, flagReader, fragmentPath, gh, git, hostedOrigin, laneLine, lanes, mappedLanes, recordCiTimeout, releasePaths, Report, runLanes, sh, shipBaseSkip, shipPolicy, shipRunMarker, short, stampedFiles } from './ship-bin-common';
 
 export const RELEASE_HELP = `gstack-ship-release — /ship Steps 12 and 15-17 (ship/SKILL.md)
 
@@ -506,6 +506,22 @@ function docsFresh(cwd: string, base: string, postFile: string, moved: readonly 
   return true;
 }
 
+/** GST-1772: a base Step 3 left unmerged (base_merge, recorded by shipBaseSkip) must still merge cleanly after the release commit, since a VERSION or CHANGELOG write can make it conflict; checked against a fresh fetch that leaves origin/<base> where Step 1 put it. Only Step 3's record says it skipped: a later fetch can move origin/<base> past a base Step 3 merged. */
+function baseStillMerges(cwd: string, base: string, r: Report): boolean {
+  const record = shipBaseSkip(cwd);
+  if (!record || !fs.existsSync(record)) return true;
+  const skipped = fs.readFileSync(record, 'utf8').trim();
+  if (/^[0-9a-f]{40,64}$/.test(skipped) && git(cwd, ['merge-base', '--is-ancestor', skipped, 'HEAD']).status === 0) return true;
+  const fetched = git(cwd, ['fetch', '--quiet', '--refmap=', 'origin', `refs/heads/${base}`], 300_000).status === 0;
+  const tip = fetched ? git(cwd, ['rev-parse', 'FETCH_HEAD']).stdout.trim() : `origin/${base}`;
+  const m = git(cwd, ['merge-tree', '--write-tree', '--no-messages', '--name-only', 'HEAD', tip]);
+  const where = fetched ? `origin/${base} at ${tip.slice(0, 12)}` : `origin/${base} (fetch failed; Step 1's copy)`;
+  if (m.status === 0) { r.add(`BASE_MERGE: ${where} still merges clean with HEAD (left unmerged at Step 3)`); return true; }
+  if (m.status !== 1) { r.stop(`${where}, left unmerged at Step 3, could not be checked against HEAD (merge-tree failed: ${firstLine(m.stderr) || `exit ${m.status}`}): fix git, then rerun finish`); return false; }
+  r.stop(`${where}, left unmerged at Step 3, now conflicts with HEAD in ${short(m.stdout.split('\n').slice(1).filter(Boolean), 8)}: git fetch origin ${base} && git merge origin/${base} under Step 3's conflict rules, commit, then run Steps 5-16 again`);
+  return false;
+}
+
 /** Steps 15-16; once they pass, the /ship run's preflight marker is cleared, so a full preflight may merge the base again (GST-1204). */
 export async function finish(argv: readonly string[], cwd: string): Promise<Report> {
   const { flag } = flagReader(argv);
@@ -513,8 +529,8 @@ export async function finish(argv: readonly string[], cwd: string): Promise<Repo
   if (plan.failure) return new Report().add(plan.line!).stop(`${plan.failure.message} (${plan.failure.code}); fix: ${plan.failure.fix}`);
   const r = await finishStages(argv, cwd);
   if (plan.line) r.lines.unshift(plan.line);
-  const marker = r.exit === 0 && shipRunMarker(cwd);
-  if (marker) fs.rmSync(marker, { force: true });
+  if (r.exit !== 0) return r;
+  for (const done of [shipRunMarker(cwd), shipBaseSkip(cwd)]) if (done) fs.rmSync(done, { force: true });
   return r;
 }
 
@@ -538,6 +554,7 @@ async function finishStages(argv: readonly string[], cwd: string): Promise<Repor
   }
   const policy = shipPolicy(cwd, base);
   if (!commitRelease(cwd, releasePaths(policy, cwd, 'HEAD', base), flag('--trailer'), r)) return r;
+  if (!baseStillMerges(cwd, base.replace(/^origin\//, ''), r)) return r;
   for (const cmd of all('--build')) {
     const b = sh(cwd, cmd);
     r.add(`BUILD: ${b.status === 0 ? 'ok' : `FAIL exit=${b.status}`} ${cmd.slice(0, 120)}`);

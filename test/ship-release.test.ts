@@ -6,8 +6,8 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { BUMP_NEVER_KEY_VERSION } from '../lib/ship-policy';
-import { lineOf, RELEASE, shipFixture, type ShipFx } from './helpers/ship-bin-fixture';
+import { BASE_MERGE_KEY_VERSION, BUMP_NEVER_KEY_VERSION } from '../lib/ship-policy';
+import { lineOf, PREFLIGHT, RELEASE, shipFixture, type ShipFx } from './helpers/ship-bin-fixture';
 
 setDefaultTimeout(60_000);
 const fixtures: ShipFx[] = [];
@@ -466,5 +466,78 @@ describe('push: the pre-push housekeeping guards (GST-1138)', () => {
     expect(lineOf(reused.stdout, 'GUARDS')).toMatch(/^GUARDS: pass \(reused from pregate-finish-preflight\.json at tree /);
     expect(runs()).toBe('');
     expect(lineOf(reused.stdout, 'PUSH')).toMatch(/^PUSH: pushed /);
+  });
+});
+
+describe('finish after a skipped base merge (GST-1772)', () => {
+  // Value: protects=a base Step 3 left unmerged under base_merge is rechecked after the release commit against a fresh fetch, so a VERSION bump that now conflicts stops finish with the files named instead of reaching the merge queue;
+  //   fails_when=finish passes a head whose release commit conflicts with the moved base, merges it itself, or moves origin/<base>;
+  //   why_new=GST-1772 autoplan finding (claim-at-open bump after a skipped merge); seam=git fetch --refmap=, git merge-tree; no_claim=how the conflict is resolved
+  test('a skipped base that the release commit now conflicts with stops finish; one that still merges is reported clean', () => {
+    const policy = { '.gstack/ship-policy.json': JSON.stringify({ base_merge: 'on-conflict', min_gstack_version: BASE_MERGE_KEY_VERSION }) + '\n' };
+    const f = fx(policy);
+    f.advanceBase({ 'docs/new.md': '# new\n' });
+    expect(lineOf(f.run(PREFLIGHT, ['--base', 'main']).stdout, 'MERGE')).toMatch(/^MERGE: skipped \(origin\/main is 1 commit/);
+    const step1 = f.git('rev-parse', 'origin/main').stdout.trim();
+    const reviewed = wtree(f);
+    const post = snapshot(f);
+    f.advanceBase({ VERSION: '1.0.1.0\n' });
+    f.write({ VERSION: '1.0.0.1\n' });
+    const stopped = f.run(RELEASE, ['finish', '--base', 'main', '--reviewed-tree', reviewed, '--docs-post', post, '--lane', LANE]);
+    expect(stopped.status).toBe(3);
+    expect(stopped.stdout).toMatch(/STOP: origin\/main at [0-9a-f]{12}, left unmerged at Step 3, now conflicts with HEAD in VERSION: git fetch origin main && git merge origin\/main under Step 3's conflict rules/);
+    expect(f.git('rev-parse', 'origin/main').stdout.trim()).toBe(step1);
+    const g = fx(policy);
+    g.advanceBase({ 'docs/new.md': '# new\n' });
+    g.run(PREFLIGHT, ['--base', 'main']);
+    const reviewed2 = wtree(g);
+    const post2 = snapshot(g);
+    g.write({ VERSION: '1.0.0.1\n' });
+    const clean = g.run(RELEASE, ['finish', '--base', 'main', '--reviewed-tree', reviewed2, '--docs-post', post2, '--lane', LANE]);
+    expect(lineOf(clean.stdout, 'BASE_MERGE')).toMatch(/^BASE_MERGE: origin\/main at [0-9a-f]{12} still merges clean with HEAD \(left unmerged at Step 3\)$/);
+  });
+
+  // Value: protects=under auto, a base Step 3 skipped on a detected queue is still rechecked when finish's own queue check fails;
+  //   fails_when=a failed second gh answer makes finish return without the merge-tree recheck; why_new=pass-1 review of GST-1772 (finish trusted a second gh call); seam=gh api graphql; no_claim=GitHub's queue semantics
+  test('auto: a failed queue check at finish still rechecks a base Step 3 skipped', () => {
+    const f = fx();
+    f.gh('case "$*" in *mergeQueue*) echo true ;; esac');
+    f.advanceBase({ 'docs/new.md': '# new\n' });
+    expect(lineOf(f.run(PREFLIGHT, ['--base', 'main']).stdout, 'MERGE')).toMatch(/^MERGE: skipped \(origin\/main is 1 commit/);
+    const reviewed = wtree(f);
+    const post = snapshot(f);
+    f.gh('case "$*" in *mergeQueue*) echo "HTTP 502" >&2; exit 1 ;; esac');
+    f.write({ VERSION: '1.0.0.1\n' });
+    const r = f.run(RELEASE, ['finish', '--base', 'main', '--reviewed-tree', reviewed, '--docs-post', post, '--lane', LANE]);
+    expect(lineOf(r.stdout, 'BASE_MERGE')).toMatch(/^BASE_MERGE: origin\/main at [0-9a-f]{12} still merges clean with HEAD \(left unmerged at Step 3\)$/);
+  });
+
+  // Value: protects=finish reads Step 3's recorded skip and never re-derives it, so a base Step 3 merged that a later fetch moved (the lost-slot restamp flow) is not taken for a skipped one;
+  //   fails_when=finish stops with "left unmerged at Step 3" because HEAD lacks the moved origin/<base>, or a passing finish leaves the skip record behind;
+  //   why_new=GSTA-383 fix-check CRITICAL (ship-rereview-triggers lost-slot red at 4a7cb42); seam=git rev-parse --git-path gstack-ship-base-skip; no_claim=the restamp itself
+  test('a base Step 3 merged that origin/<base> then moves past is not rechecked; a passing finish clears the skip record', () => {
+    const f = fx({ '.gstack/ship-policy.json': JSON.stringify({ base_merge: 'always', min_gstack_version: BASE_MERGE_KEY_VERSION }) + '\n' });
+    f.advanceBase({ 'docs/new.md': '# new\n' });
+    expect(lineOf(f.run(PREFLIGHT, ['--base', 'main']).stdout, 'MERGE')).toMatch(/^MERGE: merged origin\/main at /);
+    const record = path.join(f.work, '.git', 'gstack-ship-base-skip');
+    expect(fs.existsSync(record)).toBe(false);
+    const reviewed = wtree(f);
+    const post = snapshot(f);
+    f.advanceBase({ VERSION: '1.0.1.0\n' });
+    f.git('fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    f.write({ VERSION: '1.0.0.1\n' });
+    const r = f.run(RELEASE, ['finish', '--base', 'main', '--reviewed-tree', reviewed, '--docs-post', post, '--lane', LANE]);
+    expect(r.stdout).not.toContain('left unmerged at Step 3');
+    expect(lineOf(r.stdout, 'BASE_MERGE')).toBe('');
+    const g = fx({ '.gstack/ship-policy.json': JSON.stringify({ base_merge: 'on-conflict', min_gstack_version: BASE_MERGE_KEY_VERSION }) + '\n' });
+    g.advanceBase({ 'docs/new.md': '# new\n' });
+    g.run(PREFLIGHT, ['--base', 'main']);
+    const skipRecord = path.join(g.work, '.git', 'gstack-ship-base-skip');
+    expect(fs.readFileSync(skipRecord, 'utf8').trim()).toBe(g.git('rev-parse', 'origin/main').stdout.trim());
+    const reviewed2 = wtree(g);
+    const post2 = snapshot(g);
+    g.write({ VERSION: '1.0.0.1\n' });
+    const clean = g.run(RELEASE, ['finish', '--base', 'main', '--reviewed-tree', reviewed2, '--docs-post', post2, '--lane', LANE]);
+    expect([clean.status, fs.existsSync(skipRecord)]).toEqual([0, false]);
   });
 });
